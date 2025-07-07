@@ -1,0 +1,1 @@
+This folder is a caching folder where data pulled from FastF1 is saved.
