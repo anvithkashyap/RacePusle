@@ -1,0 +1,544 @@
+attrs==25.3.0
+cattrs==25.1.1
+certifi==2025.6.15
+charset-normalizer==3.4.2
+contourpy==1.3.2
+cycler==0.12.1
+fastf1==3.5.3
+fonttools==4.58.4
+idna==3.10
+kiwisolver==1.4.8
+matplotlib==3.10.3
+numpy==2.3.1
+packaging==25.0
+pandas==2.3.0
+pillow==11.2.1
+platformdirs==4.3.8
+pyparsing==3.2.3
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.17
+PyQt5_sip==12.17.0
+python-dateutil==2.9.0.post0
+pytz==2025.2
+QDarkStyle==3.2.3
+QtAwesome==1.4.0
+QtPy==2.4.3
+RapidFuzz==3.13.0
+requests==2.32.4
+requests-cache==1.2.1
+scipy==1.16.0
+six==1.17.0
+timple==0.1.8
+typing_extensions==4.14.0
+tzdata==2025.2
+url-normalize==2.2.1
+urllib3==2.5.0
+websockets==13.1
+
+import sys
+import pandas as pd  # type: ignore
+from datetime import timedelta
+from PyQt5.QtGui import QFont, QDrag # type: ignore
+from PyQt5.QtWidgets import ( # type: ignore
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QComboBox, QTabWidget
+)
+from PyQt5.QtWidgets import QDialog, QListWidget, QListWidgetItem, QPushButton, QHBoxLayout, QVBoxLayout, QLabel, QMessageBox
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas # type: ignore
+from matplotlib.figure import Figure # type: ignore
+import fastf1 # type: ignore
+from PyQt5.QtCore import Qt, QMimeData
+fastf1.Cache.enable_cache('./cache')
+
+class DraggableList(QListWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSelectionMode(QListWidget.SingleSelection)
+        self.setAcceptDrops(True)
+        self.setDragEnabled(True)
+        self.setDropIndicatorShown(True)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setDragDropMode(QListWidget.DragDrop)  # allows full control
+
+    def startDrag(self, supportedActions):
+        item = self.currentItem()
+        if not item:
+            return
+        mime = QMimeData()
+        mime.setText(item.text())
+
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec_(Qt.MoveAction)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasText():
+            text = event.mimeData().text()
+
+            if not self.findItems(text, Qt.MatchExactly):
+                self.addItem(text)
+
+            # Remove from source list
+            source = event.source()
+            if source and source != self:
+                items = source.findItems(text, Qt.MatchExactly)
+                for item in items:
+                    row = source.row(item)
+                    source.takeItem(row)
+
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
+class ComparisonSettingsDialog(QDialog):
+    def __init__(self, drivers, selected=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Comparison Mode Setup")
+        self.setGeometry(300, 200, 600, 400)
+        self.selected_drivers = selected if selected else []
+
+        layout = QHBoxLayout()
+
+        # Available drivers list (drag source)
+        self.available_list = DraggableList()
+        self.available_list.setDragEnabled(True)
+        self.available_list.setSelectionMode(QListWidget.SingleSelection)
+        self.available_list.setDragDropMode(QListWidget.DragDrop)
+
+        for d in drivers:
+            if d not in self.selected_drivers:
+                self.available_list.addItem(d)
+
+        # Selected drivers list (drop target)
+        self.selected_list = DraggableList()
+
+        for d in self.selected_drivers:
+            self.selected_list.addItem(d)
+
+        layout.addWidget(QLabel("Available Drivers"))
+        layout.addWidget(self.available_list)
+        layout.addWidget(QLabel("Compare These"))
+        layout.addWidget(self.selected_list)
+
+        # Save button
+        btn_layout = QVBoxLayout()
+        self.save_btn = QPushButton("Save")
+        self.save_btn.clicked.connect(self.save_selection)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.save_btn)
+        layout.addLayout(btn_layout)
+
+        self.setLayout(layout)
+
+    def save_selection(self):
+        items = [self.selected_list.item(i).text() for i in range(self.selected_list.count())]
+        if len(items) > 5:
+            QMessageBox.warning(self, "Too Many", "Please select a maximum of 5 drivers.")
+            return
+        self.selected_drivers = items
+        self.accept()
+
+    def get_selected_drivers(self):
+        return self.selected_drivers
+    
+class RacePulseApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("RacePulse - Motorsport Telemetry")
+        self.setGeometry(100, 100, 1200, 700)
+
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+        self.comparison_drivers = []
+
+        self.event_schedule = {}
+
+        self.init_ui()
+        self.init_plot()
+
+    def init_ui(self):
+        top_bar = QHBoxLayout()
+
+        #Mode
+        self.mode_dropdown = QComboBox()
+        self.mode_dropdown.addItems(["Single Driver", "Comparison Mode"])
+        self.mode_dropdown.currentIndexChanged.connect(self.on_mode_changed)
+        top_bar.addWidget(QLabel("Mode:"))
+        top_bar.addWidget(self.mode_dropdown)
+
+        #for year
+        self.year_dropdown = QComboBox()
+        self.year_dropdown.addItems(["2021", "2022", "2023", "2024"])
+        self.year_dropdown.currentIndexChanged.connect(self.on_year_changed)
+        top_bar.addWidget(QLabel("Year:"))
+        top_bar.addWidget(self.year_dropdown)
+
+        #for circuit
+        self.race_dropdown = QComboBox()
+        self.race_dropdown.addItems(["monza", "spa", "silverstone", "monaco"])
+        top_bar.addWidget(QLabel("GP:"))
+        top_bar.addWidget(self.race_dropdown)
+
+        #for session
+        self.session_dropdown = QComboBox()
+        self.session_dropdown.addItems(["Q", "R", "FP1", "FP2"])
+        top_bar.addWidget(QLabel("Session:"))
+        top_bar.addWidget(self.session_dropdown)
+
+        #for driver
+        self.driver_dropdown = QComboBox()
+        self.driver_dropdown.addItem("Select session first")  # Placeholder
+        top_bar.addWidget(QLabel("Driver:"))
+        top_bar.addWidget(self.driver_dropdown)
+        self.comparison_drivers = []
+
+
+        #for lap selection
+        self.lap_dropdown = QComboBox()
+        self.lap_dropdown.addItem("Select a driver first")
+        top_bar.addWidget(QLabel("Lap:"))
+        top_bar.addWidget(self.lap_dropdown)
+        self.lap_dropdown.currentIndexChanged.connect(self.on_lap_selected)
+
+        self.load_button = QPushButton("Load Telemetry")
+        self.load_button.clicked.connect(self.on_load_clicked)
+        top_bar.addWidget(self.load_button)
+        
+        # Settings Button for Comparison Mode
+        self.settings_button = QPushButton("⚙️ Comparison Settings")
+        self.settings_button.setVisible(False)  # Only visible in Comparison Mode
+        self.settings_button.clicked.connect(self.open_comparison_settings)
+        top_bar.addWidget(self.settings_button)
+
+
+        self.layout.addLayout(top_bar)
+
+        self.podium_label = QLabel("")
+        self.podium_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.layout.addWidget(self.podium_label)
+
+        self.driver_dropdown.currentIndexChanged.connect(self.on_driver_selected)
+
+        self.circuit_info_label = QLabel("Circuit Info:")
+        top_bar.addWidget(self.circuit_info_label)
+
+        self.race_dropdown.currentIndexChanged.connect(self.on_race_changed)
+
+
+    def on_mode_changed(self):
+        is_comparison = self.mode_dropdown.currentText() == "Comparison Mode"
+
+        self.driver_dropdown.setVisible(not is_comparison)
+        self.lap_dropdown.setVisible(not is_comparison)
+
+        self.settings_button.setVisible(is_comparison)
+
+        if not is_comparison:
+            self.speed_canvas.ax.clear()
+            self.speed_canvas.ax.set_title("Speed vs Distance")
+            self.speed_canvas.draw()
+        
+    def open_comparison_settings(self):
+        if not hasattr(self, 'session'):
+            QMessageBox.information(self, "Info", "Please load a session first.")
+            return
+
+        all_drivers = sorted(self.session.laps['Driver'].unique())
+        dialog = ComparisonSettingsDialog(all_drivers, selected=self.comparison_drivers, parent=self)
+        
+        if dialog.exec_():
+            self.comparison_drivers = dialog.get_selected_drivers()
+            print("Selected drivers:", self.comparison_drivers)
+            self.plot_comparison_graph()
+
+    def plot_comparison_graph(self):
+        if not self.comparison_drivers:
+            return
+
+        colors = ['dodgerblue', 'orangered', 'limegreen', 'purple', 'gold']
+
+        # Clear all canvases
+        for canvas in [self.speed_canvas, self.throttle_canvas, self.brake_canvas, self.gear_canvas]:
+            canvas.ax.clear()
+
+        for i, driver in enumerate(self.comparison_drivers):
+            try:
+                lap = self.session.laps.pick_driver(driver).pick_fastest()
+                telemetry = lap.get_car_data().add_distance()
+
+                # Plot Speed
+                self.speed_canvas.ax.plot(telemetry['Distance'], telemetry['Speed'],
+                                        label=driver, color=colors[i % len(colors)])
+                # Plot Throttle
+                self.throttle_canvas.ax.plot(telemetry['Distance'], telemetry['Throttle'],
+                                            label=driver, color=colors[i % len(colors)])
+                # Plot Brake
+                self.brake_canvas.ax.plot(telemetry['Distance'], telemetry['Brake'],
+                                        label=driver, color=colors[i % len(colors)])
+                # Plot Gear
+                self.gear_canvas.ax.plot(telemetry['Distance'], telemetry['nGear'],
+                                        label=driver, color=colors[i % len(colors)])
+
+            except Exception as e:
+                print(f"[Comparison Mode] Error with driver {driver}: {e}")
+
+        # Speed Tab
+        self.speed_canvas.ax.set_title("Speed Comparison")
+        self.speed_canvas.ax.set_xlabel("Distance (m)")
+        self.speed_canvas.ax.set_ylabel("Speed (km/h)")
+        self.speed_canvas.ax.legend()
+        self.speed_canvas.ax.grid(True)
+
+        # Throttle Tab
+        self.throttle_canvas.ax.set_title("Throttle Comparison")
+        self.throttle_canvas.ax.set_xlabel("Distance (m)")
+        self.throttle_canvas.ax.set_ylabel("Throttle (%)")
+        self.throttle_canvas.ax.legend()
+        self.throttle_canvas.ax.grid(True)
+
+        # Brake Tab
+        self.brake_canvas.ax.set_title("Brake Comparison")
+        self.brake_canvas.ax.set_xlabel("Distance (m)")
+        self.brake_canvas.ax.set_ylabel("Brake (0/1)")
+        self.brake_canvas.ax.legend()
+        self.brake_canvas.ax.grid(True)
+
+        # Gear Tab
+        self.gear_canvas.ax.set_title("Gear Comparison")
+        self.gear_canvas.ax.set_xlabel("Distance (m)")
+        self.gear_canvas.ax.set_ylabel("Gear")
+        self.gear_canvas.ax.legend()
+        self.gear_canvas.ax.grid(True)
+
+        # Redraw them all
+        self.speed_canvas.draw()
+        self.throttle_canvas.draw()
+        self.brake_canvas.draw()
+        self.gear_canvas.draw()
+
+
+
+    def display_session_highlights(self, session_type):
+        podium_text = ""
+        try:
+            if session_type == "R":
+                results = self.session.results.head(3)
+                first = results.iloc[0]['Abbreviation']
+                second = results.iloc[1]['Abbreviation']
+                third = results.iloc[2]['Abbreviation']
+
+                podium_text = f"""
+                <pre>
+                🥇 {first}     🥈 {second}      🥉 {third}
+                </pre>
+                """
+
+            elif session_type == "Q":
+                pole = self.session.results.iloc[0]['Abbreviation']
+                podium_text = f"<b>🏁 Pole Position:</b> {pole}"
+
+            else:
+                podium_text = "📊 No podium data for this session type."
+
+            self.podium_label.setText(podium_text)
+
+        except Exception as e:
+            self.podium_label.setText(f"<i>Error loading podium data: {e}</i>")
+
+
+    def on_race_changed(self):
+        race_name = self.race_dropdown.currentText()
+        event = self.event_schedule.get(race_name)
+
+        if event:
+            info = f"{event['circuit']}, {event['country']} ({event['date'].date()})"
+            self.circuit_info_label.setText(f"Circuit Info: {info}")
+        else:
+            self.circuit_info_label.setText("Circuit Info: -")
+
+    
+    def on_year_changed(self):
+        year = int(self.year_dropdown.currentText())
+        try:
+            schedule = fastf1.get_event_schedule(year)
+            self.race_dropdown.clear()
+            self.event_schedule.clear()
+
+            for _, event in schedule.iterrows():
+                event_name = event['EventName']
+                round_num = event['RoundNumber']
+                self.race_dropdown.addItem(event_name)
+                self.event_schedule[event_name] = {
+                    'round': round_num,
+                    'circuit': event['Location'],
+                    'country': event['Country'],
+                    'date': event['EventDate']
+                }
+
+        except Exception as e:
+            self.race_dropdown.clear()
+            self.race_dropdown.addItem("Error loading races")
+            print(f"Failed to load races: {e}")
+        
+    def on_lap_selected(self):
+        if not hasattr(self, 'selected_driver_laps'):
+            return
+
+        lap_index = self.lap_dropdown.currentIndex()
+        if lap_index < 0:
+            return
+
+        lap_number = self.lap_dropdown.itemData(lap_index)
+        lap = self.selected_driver_laps[self.selected_driver_laps['LapNumber'] == lap_number]
+        if not lap.empty:
+            self.plot_selected_lap(lap.iloc[0])
+    
+    def on_driver_selected(self):
+        selected_driver = self.driver_dropdown.currentText()
+        if selected_driver == "Select session first":
+            return
+
+        try:
+            laps = self.session.laps.pick_driver(selected_driver)
+            self.selected_driver_laps = laps  # store for later
+            self.lap_dropdown.clear()
+
+            for _, lap in laps.iterlaps():
+                lap_number = lap['LapNumber']
+                lap_time = lap['LapTime']
+                if pd.notna(lap_time) and isinstance(lap_time, timedelta):
+                    total_seconds = lap_time.total_seconds()
+                    minutes = int(total_seconds // 60)
+                    seconds = int(total_seconds % 60)
+                    milliseconds = int((total_seconds - int(total_seconds)) * 1000)
+                    lap_time_str = f"{minutes}:{seconds:02d}.{milliseconds:03d}"
+                else:
+                    lap_time_str = "N/A"
+                label = f"Lap {lap_number} - {lap_time_str}"
+                self.lap_dropdown.addItem(label, userData=lap_number)
+
+            self.lap_dropdown.setCurrentIndex(0)
+            self.plot_selected_lap(laps.pick_fastest())  # default show fastest
+
+        except Exception as e:
+            self.speed_canvas.ax.clear()
+            self.speed_canvas.ax.text(0.5, 0.5, f"Error: {str(e)}", ha='center', va='center')
+            self.speed_canvas.draw()
+    
+    def plot_selected_lap(self, lap):
+        telemetry = lap.get_car_data().add_distance()
+
+        # SPEED
+        self.speed_canvas.ax.clear()
+        self.speed_canvas.ax.plot(telemetry['Distance'], telemetry['Speed'], color='deepskyblue')
+        self.speed_canvas.ax.set_title("Speed vs Distance")
+        self.speed_canvas.ax.set_xlabel("Distance (m)")
+        self.speed_canvas.ax.set_ylabel("Speed (km/h)")
+        self.speed_canvas.ax.grid(True)
+        self.speed_canvas.draw()
+
+        # THROTTLE
+        self.throttle_canvas.ax.clear()
+        self.throttle_canvas.ax.plot(telemetry['Distance'], telemetry['Throttle'], color='lime')
+        self.throttle_canvas.ax.set_title("Throttle")
+        self.throttle_canvas.ax.set_xlabel("Distance (m)")
+        self.throttle_canvas.ax.set_ylabel("Throttle (%)")
+        self.throttle_canvas.ax.grid(True)
+        self.throttle_canvas.draw()
+
+        # BRAKE
+        self.brake_canvas.ax.clear()
+        self.brake_canvas.ax.plot(telemetry['Distance'], telemetry['Brake'], color='red')
+        self.brake_canvas.ax.set_title("Brake")
+        self.brake_canvas.ax.set_xlabel("Distance (m)")
+        self.brake_canvas.ax.set_ylabel("Brake (boolean)")
+        self.brake_canvas.ax.grid(True)
+        self.brake_canvas.draw()
+
+        # GEAR
+        self.gear_canvas.ax.clear()
+        self.gear_canvas.ax.plot(telemetry['Distance'], telemetry['nGear'], color='orange')
+        self.gear_canvas.ax.set_title("Gear")
+        self.gear_canvas.ax.set_xlabel("Distance (m)")
+        self.gear_canvas.ax.set_ylabel("Gear")
+        self.gear_canvas.ax.grid(True)
+        self.gear_canvas.draw()
+
+
+    def init_plot(self):
+        self.tabs = QTabWidget()
+        self.layout.addWidget(self.tabs)
+
+        self.speed_canvas = self.create_plot_canvas("Speed vs Distance")
+        self.throttle_canvas = self.create_plot_canvas("Throttle")
+        self.brake_canvas = self.create_plot_canvas("Brake")
+        self.gear_canvas = self.create_plot_canvas("Gear")
+
+        self.tabs.addTab(self.speed_canvas, "Speed")
+        self.tabs.addTab(self.throttle_canvas, "Throttle")
+        self.tabs.addTab(self.brake_canvas, "Brake")
+        self.tabs.addTab(self.gear_canvas, "Gear")
+    
+    def create_plot_canvas(self, title):
+        canvas = FigureCanvas(Figure(figsize=(6, 4)))
+        ax = canvas.figure.add_subplot(111)
+        ax.set_title(title)
+        canvas.ax = ax  
+        return canvas
+
+
+    def on_load_clicked(self):
+        year = int(self.year_dropdown.currentText())
+        race = self.race_dropdown.currentText()
+        session_type = self.session_dropdown.currentText()
+
+        try:
+            self.load_button.setText("Loading...")
+            self.load_button.setEnabled(False)
+
+            round_info = self.event_schedule.get(race)
+            if not round_info:
+                print("Race not found in schedule.")
+                return
+
+            round_number = round_info['round']
+            session = fastf1.get_session(year, round_number, session_type)
+
+            session.load()
+            self.session = session
+            self.display_session_highlights(session_type)
+
+            self.driver_dropdown.clear()
+            drivers = sorted(session.laps['Driver'].unique())
+            self.driver_dropdown.addItems(drivers)
+
+
+            self.speed_canvas.ax.clear()
+            self.speed_canvas.ax.set_title("Select a driver to view telemetry")
+            self.speed_canvas.draw()
+
+        except Exception as e:
+            self.speed_canvas.ax.clear()
+            self.speed_canvas.ax.text(0.5, 0.5, f"Error: {str(e)}", ha='center', va='center', wrap=True)
+            self.speed_canvas.draw()
+
+        finally:
+            self.load_button.setText("Load Telemetry")
+            self.load_button.setEnabled(True)
+
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = RacePulseApp()
+    window.show()
+    sys.exit(app.exec_())
